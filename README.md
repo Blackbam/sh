@@ -1,2 +1,4 @@
 # sh
-This is just a random collection of useful Linux shell scripts.
+
+This is just a random collection of useful Linux shell scripts (Ubuntu, Mint).
+
