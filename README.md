@@ -8,6 +8,6 @@ Update apt, snap, flatpak.
 
 = backup-ubuntu.sh =
 
-Update a full ubuntu system.
+Save installed packages (apt, Flatpak, Snap), apt sources, GNOME settings and optionally /etc to a drive in seconds, with a restore script. For the home folder it recommends restic (fast, incremental) and prints the commands.
 
 
