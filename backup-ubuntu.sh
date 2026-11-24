@@ -4,15 +4,26 @@
 # (apt, Flatpak, Snap), apt sources and keys, GNOME settings, crontab and
 # optionally /etc. Takes seconds and only a few MB.
 #
-# Your HOME FOLDER is not copied by this script. Use restic for that (see
-# "HOME FOLDER BACKUP" below). At the end the script prints the exact commands
-# for your drive.
+# Your HOME FOLDER is backed up with restic when you pass --home (see
+# "HOME FOLDER BACKUP" below). Without --home the script prints the exact
+# restic commands for your drive.
+#
+# Project dependencies are never backed up, because "npm/yarn/pnpm install"
+# and "composer install" bring them back: node_modules, bower_components,
+# .pnpm-store, .yarn/cache, .yarn/unplugged and every vendor/ folder that has a
+# composer.json next to it (other folders named vendor are kept). Package
+# manager download caches (~/.npm, ~/.cache, ...) are skipped too.
+# Each run writes these rules to ~/.config/backup-ubuntu/restic-excludes.txt.
+# Your own extra rules (restic patterns, one per line) go into
+#   ~/.config/backup-ubuntu/exclude.txt
 #
 # Usage:
 #   ./backup-ubuntu.sh [options] /media/<you>/<DriveName>
 #
 # Options:
 #   -e, --etc    also save /etc as a .tar.gz (asks for your sudo password)
+#   -H, --home   also back up the home folder with restic (creates the restic
+#                repository <drive>/restic-home on the first run)
 #   -h, --help   show this help
 #
 # Output:
@@ -39,11 +50,11 @@
 #   # without it the backup cannot be read)
 #   restic init -r /media/<you>/<Drive>/restic-home
 #
-#   # each backup
+#   # each backup (this is what --home runs; the exclude file is written by
+#   # this script, so run the script first to refresh it)
 #   restic -r /media/<you>/<Drive>/restic-home backup "$HOME" \
 #       --one-file-system --exclude-caches \
-#       --exclude "$HOME/.cache" --exclude "$HOME/.local/share/Trash" \
-#       --exclude "$HOME/.var/app/*/cache" --exclude "$HOME/snap/*/*/.cache"
+#       --exclude-file ~/.config/backup-ubuntu/restic-excludes.txt
 #
 #   # list, keep the newest 5, verify
 #   restic -r /media/<you>/<Drive>/restic-home snapshots
@@ -61,10 +72,14 @@
 #
 # No-install alternative (one full archive each time, no incremental runs):
 # a single sequential stream is still fast because the drive never seeks.
-#   tar -C "$HOME" --exclude=./.cache --exclude=./.local/share/Trash -cf - . \
+#   tar -C "$HOME" --exclude=./.cache --exclude=./.local/share/Trash \
+#       --exclude=./.npm --exclude=node_modules --exclude=bower_components \
+#       --exclude=.yarn/cache --exclude=.pnpm-store -cf - . \
 #     | zstd -T0 -3 > /media/<you>/<Drive>/home-$(date +%F).tar.zst
 #   # restore:  zstd -dc home-<date>.tar.zst | tar -C "$HOME" -xf -
-# (zstd: sudo apt install zstd. On a FAT32 drive files are limited to 4 GB;
+# (tar cannot tell composer vendor/ folders from other vendor/ folders, so
+#  add --exclude=./path/to/project/vendor yourself.
+#  zstd: sudo apt install zstd. On a FAT32 drive files are limited to 4 GB;
 #  format the drive as ext4 or exFAT.)
 #
 # If it is still slow:
@@ -78,6 +93,7 @@
 set -uo pipefail
 
 SYSTEM_CONFIG=0
+HOME_BACKUP=0
 TARGET=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -89,6 +105,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -e|--etc)  SYSTEM_CONFIG=1; shift ;;
+    -H|--home) HOME_BACKUP=1; shift ;;
     -h|--help) usage; exit 0 ;;
     -*)        die "unknown option: $1 (see --help)" ;;
     *)         TARGET="$1"; shift ;;
@@ -99,6 +116,12 @@ done
 [[ -d "$TARGET" ]] || die "'$TARGET' is not a folder. Is the drive plugged in and mounted?"
 TARGET="$(readlink -f "$TARGET")"
 [[ -w "$TARGET" ]] || die "'$TARGET' is not writable by you (check the drive or remount it)."
+
+if [[ $HOME_BACKUP -eq 1 ]]; then
+  command -v restic >/dev/null 2>&1 || die "--home needs restic. Install it with: sudo apt install restic"
+  [[ "$TARGET" != "$HOME" && "$TARGET" != "$HOME"/* ]] \
+    || die "Target is inside your home folder. Choose an external drive."
+fi
 
 if [[ $SYSTEM_CONFIG -eq 1 ]]; then
   sudo -v || die "--etc needs sudo rights"
@@ -221,20 +244,97 @@ chmod +x "$DEST/restore-packages.sh"
 log "DONE. Setup saved in: $DEST"
 log "Size: $(du -sh "$DEST" | cut -f1)"
 
-# ---------- home folder hint ----------
+# ---------- home folder: exclude rules ----------
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/backup-ubuntu"
+EXCLUDES="$CONF_DIR/restic-excludes.txt"
+USER_EXCLUDES="$CONF_DIR/exclude.txt"
+mkdir -p "$CONF_DIR"
+
+# restic patterns treat \ * ? [ specially; escape them in real paths
+restic_escape() { sed 's/[][\\*?]/\\&/g'; }
+
+log "Searching for composer projects (vendor/ folders to skip)..."
+{
+  echo "# Written by backup-ubuntu.sh on $(date). Changes here are overwritten;"
+  echo "# put your own rules into $USER_EXCLUDES"
+  echo
+  echo "# caches and trash"
+  echo "$HOME/.cache"
+  echo "$HOME/.local/share/Trash"
+  echo "$HOME/.var/app/*/cache"
+  echo "$HOME/snap/*/*/.cache"
+  echo
+  echo "# package manager download caches"
+  echo "$HOME/.npm"
+  echo "$HOME/.yarn/berry/cache"
+  echo "$HOME/.local/share/pnpm/store"
+  echo "$HOME/.composer/cache"
+  echo "$HOME/.config/composer/cache"
+  echo
+  echo "# project dependencies, any depth (npm/yarn/pnpm install brings them back)"
+  echo "node_modules"
+  echo "bower_components"
+  echo ".pnpm-store"
+  echo ".yarn/cache"
+  echo ".yarn/unplugged"
+  echo ".yarn/install-state.gz"
+  echo
+  echo "# composer vendor/ folders (composer install brings them back)"
+  find "$HOME" -xdev \
+       \( -name node_modules -o -name vendor -o -name .git -o -name .cache \
+          -o -path "$HOME/.local/share/Trash" -o -path "$HOME/snap" -o -path "$HOME/.var" \) -prune \
+       -o -type f -name composer.json -printf '%h\n' 2>/dev/null |
+    while IFS= read -r dir; do
+      [[ -d "$dir/vendor" ]] || continue
+      if [[ "$dir" == *'$'* ]]; then
+        echo "WARNING: cannot exclude $dir/vendor (restic cannot handle \$ in exclude paths)" >&2
+        continue
+      fi
+      printf '%s/vendor\n' "$dir" | restic_escape
+    done | sort
+} > "$EXCLUDES"
+VENDOR_COUNT="$(grep -c '/vendor$' "$EXCLUDES")"
+log "Exclude rules written to $EXCLUDES ($VENDOR_COUNT composer vendor folders)"
+
+EXCLUDE_ARGS=(--exclude-file "$EXCLUDES")
+[[ -f "$USER_EXCLUDES" ]] && EXCLUDE_ARGS+=(--exclude-file "$USER_EXCLUDES")
 REPO="$TARGET/restic-home"
+
+# ---------- home folder: restic ----------
+if [[ $HOME_BACKUP -eq 1 ]]; then
+  if [[ ! -f "$REPO/config" ]]; then
+    log "Creating restic repository $REPO (choose a password and keep it safe)"
+    restic init -r "$REPO" || die "restic init failed"
+  fi
+  log "Backing up $HOME with restic..."
+  # keep the machine awake while the backup runs
+  INHIBIT=()
+  command -v systemd-inhibit >/dev/null 2>&1 \
+    && INHIBIT=(systemd-inhibit --what=sleep:idle --who=backup-ubuntu --why="Backup in progress")
+  "${INHIBIT[@]}" restic -r "$REPO" backup "$HOME" --one-file-system --exclude-caches "${EXCLUDE_ARGS[@]}"
+  rc=$?
+  case $rc in
+    0) log "Home folder backed up." ;;
+    3) log "WARNING: some files could not be read (see above). The rest is backed up." ;;
+    *) die "restic failed with code $rc" ;;
+  esac
+  log "Optional cleanup: restic -r \"$REPO\" forget --keep-last 5 --prune"
+  exit 0
+fi
+
+# ---------- home folder hint ----------
 echo
-echo "Home folder: back it up with restic (fast, incremental). Commands for this drive:"
+echo "Home folder: run this script again with --home, or use these commands:"
 if ! command -v restic >/dev/null 2>&1; then
   echo "  sudo apt install restic"
 fi
 if [[ ! -f "$REPO/config" ]]; then
   echo "  restic init -r \"$REPO\"            # once"
 fi
+# shellcheck disable=SC2016  # $HOME is printed literally on purpose
+printf '  restic -r "%s" backup "$HOME" --one-file-system --exclude-caches \\\n' "$REPO"
+printf '      %s\n' "$(printf '%q ' "${EXCLUDE_ARGS[@]}")"
 cat <<EOF
-  restic -r "$REPO" backup "\$HOME" --one-file-system --exclude-caches \\
-      --exclude "\$HOME/.cache" --exclude "\$HOME/.local/share/Trash" \\
-      --exclude "\$HOME/.var/app/*/cache" --exclude "\$HOME/snap/*/*/.cache"
   restic -r "$REPO" forget --keep-last 5 --prune   # optional cleanup
 See the top of $0 for restore commands and alternatives.
 EOF
